@@ -1,7 +1,8 @@
 import os
 import io
+import re
 import time
-from datetime import datetime
+from datetime import datetime, date
 
 import streamlit as st
 from PIL import Image
@@ -10,6 +11,9 @@ from google import genai
 from google.genai import types
 
 
+# =========================
+# 1) SYSTEM PROMPT (사용자 제공)
+# =========================
 SYSTEM_PROMPT = """
 너는 고속도로 운영기관의 시설물 유지관리 담당 기술자다.
 
@@ -60,8 +64,11 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
+# =========================
+# 2) 유틸
+# =========================
 def get_api_key() -> str | None:
-    # Streamlit Cloud: Secrets에 GEMINI_API_KEY를 넣는 걸 권장
+    # Streamlit Cloud: Secrets에 GEMINI_API_KEY 추천
     if "GEMINI_API_KEY" in st.secrets:
         return st.secrets["GEMINI_API_KEY"]
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
@@ -69,15 +76,99 @@ def get_api_key() -> str | None:
 
 @st.cache_resource
 def get_client(api_key: str):
-    # 키를 명시적으로 넣어두면 환경변수/시크릿 설정이 헷갈려도 안전
+    # 키를 명시적으로 넣어두면 환경변수 인식 문제를 줄일 수 있음
     return genai.Client(api_key=api_key)
 
 
-def to_pil_image(uploaded_file) -> Image.Image:
-    data = uploaded_file.read()
-    return Image.open(io.BytesIO(data)).convert("RGB")
+def bytes_to_pil_image(img_bytes: bytes) -> Image.Image:
+    return Image.open(io.BytesIO(img_bytes)).convert("RGB")
 
 
+def build_user_prompt(
+    facility_name: str,
+    inspection_date: date | None,
+    inspector: str,
+    extra_notes: str,
+    concise_mode: bool,
+) -> str:
+    """
+    user_prompt는 '요청'을 짧고 명확하게.
+    - concise_mode면 출력 분량을 명시적으로 줄여 토큰 절약
+    """
+    base = (
+        "첨부된 시설물 점검 사진 1장을 바탕으로, "
+        "시스템 지침(규칙/형식)을 엄격히 준수하여 보고서를 작성하라.\n"
+        "- 사진만으로 확정할 수 없는 내용은 반드시 '현장 확인 필요'로 표기하라.\n"
+        "- 입력되지 않은 정보는 임의로 생성하지 말라.\n"
+    )
+
+    if concise_mode:
+        base += (
+            "\n[출력 분량 지침]\n"
+            "- 각 섹션은 2~5문장 이내로 간결하게 작성하라.\n"
+            "- 체크리스트는 핵심 5~8개 항목으로 제한하라.\n"
+        )
+
+    ctx_lines = []
+    if facility_name.strip():
+        ctx_lines.append(f"- 시설물/구간: {facility_name.strip()}")
+    if inspection_date:
+        ctx_lines.append(f"- 점검일: {inspection_date.isoformat()}")
+    if inspector.strip():
+        ctx_lines.append(f"- 점검자: {inspector.strip()}")
+    if extra_notes.strip():
+        ctx_lines.append(f"- 메모: {extra_notes.strip()}")
+
+    if ctx_lines:
+        base += "\n[사용자 제공 점검 정보]\n" + "\n".join(ctx_lines) + "\n"
+
+    return base.strip()
+
+
+def call_gemini_with_retry(client, *, model: str, contents, config, max_retries: int = 4):
+    """
+    429(RESOURCE_EXHAUSTED / TooManyRequests) 발생 시 재시도.
+    에러 메시지에 'retry in XXs'가 있으면 그 시간만큼 대기.
+    없으면 지수 백오프.
+    """
+    base_sleep = 2.0
+
+    for attempt in range(max_retries + 1):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            msg = str(e)
+
+            # 재시도 대상인지 판단
+            is_rate_limited = ("429" in msg) or ("RESOURCE_EXHAUSTED" in msg) or ("TooManyRequests" in msg)
+            if not is_rate_limited:
+                raise
+
+            # retry in XXs 힌트가 있으면 우선 사용
+            m = re.search(r"retry in ([0-9]+(?:\.[0-9]+)?)s", msg, re.IGNORECASE)
+            if m:
+                sleep_s = float(m.group(1))
+            else:
+                sleep_s = base_sleep * (2 ** attempt)  # 2,4,8,16...
+
+            if attempt >= max_retries:
+                raise RuntimeError(
+                    "Gemini API 호출 제한(429)에 걸렸습니다.\n"
+                    "- 잠시 후 다시 시도하거나\n"
+                    "- AI Studio에서 Billing/쿼터(무료 티어) 상태를 확인해 주세요.\n\n"
+                    f"원문 에러: {msg[:600]}"
+                ) from e
+
+            time.sleep(sleep_s)
+
+
+# =========================
+# 3) Streamlit UI
+# =========================
 def main():
     st.set_page_config(page_title="시설물 점검 보고서 생성기", layout="wide")
     st.title("🛣️ 시설물 점검 보고서 생성 (이미지 → Gemini)")
@@ -95,9 +186,15 @@ def main():
         st.subheader("모델/출력 설정")
         model = st.text_input("model", value="gemini-2.0-flash")
         temperature = st.slider("temperature", 0.0, 1.0, 0.2, 0.05)
-        max_tokens = st.number_input("max_output_tokens", min_value=256, max_value=8192, value=2048, step=256)
+
+        # 토큰 절약용 기본값: 1024
+        max_tokens = st.number_input("max_output_tokens", 256, 8192, 1024, step=256)
+
+        concise_mode = st.toggle("간단 모드(토큰 절약)", value=True)
+        st.caption("간단 모드: 섹션/체크리스트 분량을 제한하여 비용/쿼터 소모를 줄입니다.")
+
         st.divider()
-        st.caption("업무 보고서 안정성은 temperature 낮게(0.0~0.3) 추천")
+        st.caption("※ 429가 잦으면 Billing 연결이 가장 안정적입니다.")
 
     uploaded = st.file_uploader("점검 사진 1장을 업로드하세요 (JPG/PNG)", type=["jpg", "jpeg", "png"])
 
@@ -106,65 +203,53 @@ def main():
     with col1:
         st.subheader("입력 이미지")
         if uploaded:
-            img = to_pil_image(uploaded)
-            st.image(img, use_container_width=True)
+            img_bytes = uploaded.getvalue()
+            img_preview = bytes_to_pil_image(img_bytes)
+            st.image(img_preview, use_container_width=True)
         else:
-            st.info("사진을 업로드하면 보고서 생성이 가능합니다.")
+            st.info("사진을 업로드하면 보고서 생성 버튼이 활성화됩니다.")
 
     with col2:
-        st.subheader("생성 결과")
+        st.subheader("보고서")
         if not uploaded:
             st.empty()
             return
 
-        # 업로드 파일은 read()가 한 번 소비되므로, 버튼 클릭 때 다시 읽기 위해
-        # Streamlit이 제공하는 uploaded.getvalue()를 사용해 안전하게 처리
+        # 업로드 파일 read() 문제 방지: getvalue()로 bytes 확보
         img_bytes = uploaded.getvalue()
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        img = bytes_to_pil_image(img_bytes)
 
-        # (선택) 점검 개요에 넣을 수 있는 “사용자 입력” — 없으면 모델이 임의 생성하면 안 되니, 여기서 받는 게 안정적
         with st.expander("점검 정보 입력(선택)", expanded=False):
             facility_name = st.text_input("시설물 명/구간(선택)", value="")
             inspection_date = st.date_input("점검일(선택)", value=None)
             inspector = st.text_input("점검자(선택)", value="")
             extra_notes = st.text_area("추가 메모(선택)", value="", height=80)
 
-        user_context_lines = []
-        if facility_name:
-            user_context_lines.append(f"- 시설물/구간: {facility_name}")
-        if inspection_date:
-            user_context_lines.append(f"- 점검일: {inspection_date.isoformat()}")
-        if inspector:
-            user_context_lines.append(f"- 점검자: {inspector}")
-        if extra_notes.strip():
-            user_context_lines.append(f"- 메모: {extra_notes.strip()}")
-
-        user_context = "\n".join(user_context_lines).strip()
-
         if st.button("보고서 생성", type="primary", use_container_width=True):
             client = get_client(api_key)
 
-            user_prompt = (
-                "첨부된 시설물 점검 사진 1장을 바탕으로, 위 기준과 형식을 엄격히 준수하여 보고서를 작성하라.\n"
-                "사진만으로 확정할 수 없는 내용은 반드시 '현장 확인 필요'로 표기하라.\n"
+            user_prompt = build_user_prompt(
+                facility_name=facility_name,
+                inspection_date=inspection_date,
+                inspector=inspector,
+                extra_notes=extra_notes,
+                concise_mode=concise_mode,
             )
-            if user_context:
-                user_prompt += "\n[사용자 제공 점검 정보]\n" + user_context + "\n"
+
+            config = types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=float(temperature),
+                max_output_tokens=int(max_tokens),
+            )
 
             with st.spinner("Gemini가 보고서를 작성 중입니다..."):
-                try:
-                    resp = client.models.generate_content(
-                        model=model,
-                        contents=[user_prompt, img],
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            temperature=float(temperature),
-                            max_output_tokens=int(max_tokens),
-                        ),
-                    )
-                except Exception as e:
-                    st.error(f"Gemini 호출 중 오류: {e}")
-                    st.stop()
+                resp = call_gemini_with_retry(
+                    client,
+                    model=model,
+                    contents=[user_prompt, img],
+                    config=config,
+                    max_retries=4,
+                )
 
             report = (resp.text or "").strip()
             if not report:
@@ -175,15 +260,14 @@ def main():
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button(
-                label="보고서 다운로드 (Markdown)",
+                "보고서 다운로드 (MD)",
                 data=report.encode("utf-8"),
                 file_name=f"inspection_report_{ts}.md",
                 mime="text/markdown",
                 use_container_width=True,
             )
-
             st.download_button(
-                label="보고서 다운로드 (TXT)",
+                "보고서 다운로드 (TXT)",
                 data=report.encode("utf-8"),
                 file_name=f"inspection_report_{ts}.txt",
                 mime="text/plain",
