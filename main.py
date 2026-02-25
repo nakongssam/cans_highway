@@ -10,8 +10,8 @@ st.set_page_config(page_title="고속도로 시설물 점검 보고서 AI", layo
 if "GEMINI_API_KEY" in st.secrets:
     api_key = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=api_key)
-    # 무료 티어에서 가장 효율적인 gemini-2.0-flash 사용
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    # 무료 티어에서 가장 효율적인 gemini-1.5-flash 사용
+    model = genai.GenerativeModel('gemini-1.5-flash')
 else:
     st.error("⚠️ Streamlit Secrets에 'GEMINI_API_KEY'가 설정되지 않았습니다.")
     st.stop() # 키가 없으면 앱 중단
