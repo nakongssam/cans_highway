@@ -1,3 +1,2 @@
-streamlit
-google-generativeai
-Pillow
+streamlit>=1.31
+openai>=1.0.0
