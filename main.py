@@ -1,195 +1,281 @@
-import os
-import io
-import time
-from datetime import datetime
+import base64
+import mimetypes
+from typing import Optional
 
 import streamlit as st
-from PIL import Image
-
-from google import genai
-from google.genai import types
+from openai import OpenAI
 
 
-SYSTEM_PROMPT = """
-너는 고속도로 운영기관의 시설물 유지관리 담당 기술자다.
+# ----------------------------
+# Helpers
+# ----------------------------
+ALLOWED_MIME = {"image/png", "image/jpeg", "image/webp"}
+ALLOWED_EXTS = ["png", "jpg", "jpeg", "webp"]
 
-입력되는 시설물 점검 사진 1장을 바탕으로
-현장 점검 보고서 초안을 작성하는 업무를 수행한다.
 
-다음의 절차에 따라 분석을 수행할 것:
+def get_mime_type(file_name: str) -> str:
+    """
+    Guess MIME type from file name. Fallback to application/octet-stream.
+    For jpg/jpeg, mimetypes returns image/jpeg (good).
+    """
+    mime, _ = mimetypes.guess_type(file_name)
+    return mime or "application/octet-stream"
 
-1. 사진에 나타난 시설물의 외관 상태를 관찰하여
-   손상, 변형, 오염, 파손 등의 이상 여부를 식별한다.
 
-2. 식별된 이상 현상이 있을 경우,
-   해당 손상의 유형을 기술적으로 판정한다.
-   (예: 균열, 박리, 부식, 침하, 탈락 등)
+def file_to_data_url(uploaded_file) -> str:
+    """
+    Convert uploaded image to base64 data URL: data:<mime>;base64,<...>
+    """
+    raw = uploaded_file.getvalue()
+    mime = get_mime_type(uploaded_file.name)
 
-3. 해당 이상이 시설물의 기능 또는 안전성에 미칠 수 있는
-   잠재적 영향을 고려하여 위험도를 다음 중 하나로 평가한다.
-   - 낮음
-   - 중간
-   - 높음
+    # Streamlit uploader may provide jpg/jpeg; ensure mime is acceptable
+    # If guessing failed but content type exists, try that
+    if mime == "application/octet-stream" and getattr(uploaded_file, "type", None):
+        mime = uploaded_file.type
 
-4. 긴급한 안전 위험이 예상되는 경우에만
-   즉시 조치 필요 사항을 제시한다.
+    if mime not in ALLOWED_MIME:
+        # Allow jpeg even if uploader gives image/jpg (rare)
+        if mime == "image/jpg":
+            mime = "image/jpeg"
+        else:
+            raise ValueError(f"지원하지 않는 이미지 형식입니다: {mime}")
 
-5. 중장기 유지관리를 위한
-   단계별 보수 및 정비 권고안을 작성한다.
+    b64 = base64.b64encode(raw).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
-6. 사진만으로 판단이 어려운 경우,
-   추가 점검이 필요한 항목을 체크리스트 형태로 제시한다.
 
-다음 작성 원칙을 반드시 준수할 것:
+def extract_text_from_response(resp) -> str:
+    """
+    Responses API 결과에서 텍스트를 최대한 안전하게 추출.
+    SDK 버전에 따라 output_text 속성이 있거나, output 구조를 파싱해야 할 수 있음.
+    """
+    # 1) 가장 간단한 경로(지원되는 경우)
+    text = getattr(resp, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        return text
 
-- 사진에 기반하지 않은 정보는 임의로 생성하지 말 것
-- 확정이 어려운 내용은 '현장 확인 필요'로 명시할 것
-- 과장된 표현 또는 추정성 판단을 단정적으로 서술하지 말 것
-- 기술 보고서 문체를 유지할 것
+    # 2) output 구조를 순회하며 text content 수집
+    try:
+        chunks = []
+        for item in (resp.output or []):
+            for content in (getattr(item, "content", None) or []):
+                ctype = getattr(content, "type", None)
+                if ctype in ("output_text", "text"):
+                    t = getattr(content, "text", None)
+                    if t:
+                        chunks.append(t)
+        joined = "\n".join(chunks).strip()
+        if joined:
+            return joined
+    except Exception:
+        pass
 
-보고서는 반드시 아래 형식으로 작성할 것:
+    # 3) 최후의 보루
+    return "⚠️ 응답에서 텍스트를 추출하지 못했습니다. 다시 시도해 주세요."
 
-[1. 점검 개요]
-[2. 관찰 내용 (사진 기반)]
-[3. 손상/이상 유형 판정 (가능성 포함)]
-[4. 위험도 평가 (낮음/중간/높음) 및 근거]
-[5. 즉시 조치 권고 (필요 시)]
-[6. 보수/정비 권고안 (단계별)]
-[7. 추가 점검/확인 항목 (체크리스트)]
-[8. 참고/주의 (면책 문구)]
+
+def build_prompt(
+    project_name: str,
+    road_name: str,
+    inspector: str,
+    weather: str,
+    notes: str,
+) -> str:
+    return f"""
+당신은 '고속도로 시설물 점검' 분야의 품질관리(QC) 보고서를 작성하는 전문가입니다.
+사용자가 제공한 점검 사진 1장을 바탕으로 **품질관리 보고서(Markdown)** 를 작성하세요.
+
+# 작성 원칙
+- 반드시 한국어로 작성
+- 과장 금지: 사진에서 확인 가능한 내용과 합리적 추정은 구분
+- 확인 불가한 내용은 "확인 필요"로 표기
+- 표/체크리스트를 적극 활용
+- 안전/품질/환경/교통관리 관점 포함
+- 마지막에 '조치 우선순위'와 '후속 점검 계획'을 제시
+
+# 보고서에 포함할 섹션(순서 고정)
+1. 개요 (프로젝트/노선/점검자/날씨/비고)
+2. 사진 기반 관찰 요약 (핵심 5줄 내)
+3. 결함/이상 징후 추정 및 근거 (표로: 항목, 관찰근거, 심각도(상/중/하), 확인필요 여부)
+4. 품질 기준 관점 체크리스트 (표로: 포장/배수/균열/표지/시설물/안전, 적합/주의/부적합, 메모)
+5. 즉시 조치 사항 (불릿)
+6. 보수·보강 권고 (불릿, 공법은 일반적 수준에서 제안)
+7. 위험요인 및 안전관리(작업자/운전자) (불릿)
+8. 조치 우선순위 (1~5, 근거 포함)
+9. 후속 점검 계획 (일정 예시 포함)
+10. 부록: 사진 판독 한계 및 추가 필요 자료
+
+# 입력 메타정보
+- 프로젝트명: {project_name or "미입력"}
+- 노선/구간: {road_name or "미입력"}
+- 점검자: {inspector or "미입력"}
+- 날씨/환경: {weather or "미입력"}
+- 비고: {notes or "미입력"}
+
+이제 사진을 분석해 보고서를 작성하세요.
 """.strip()
 
 
-def get_api_key() -> str | None:
-    # Streamlit Cloud: Secrets에 GEMINI_API_KEY를 넣는 걸 권장
-    if "GEMINI_API_KEY" in st.secrets:
-        return st.secrets["GEMINI_API_KEY"]
-    return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+# ----------------------------
+# Streamlit App
+# ----------------------------
+st.set_page_config(page_title="고속도로 점검 보고서 생성기", page_icon="🛣️", layout="wide")
 
+st.title("🛣️ 고속도로 점검 이미지 → 품질관리 보고서 생성기")
+st.caption("이미지를 업로드하면 OpenAI 비전 모델로 QC 보고서(Markdown)를 자동 생성합니다. (Streamlit Community Cloud 배포용)")
 
-@st.cache_resource
-def get_client(api_key: str):
-    # 키를 명시적으로 넣어두면 환경변수/시크릿 설정이 헷갈려도 안전
-    return genai.Client(api_key=api_key)
+# Secrets 체크
+api_key: Optional[str] = None
+try:
+    api_key = st.secrets["OPENAI_API_KEY"]
+except Exception:
+    api_key = None
 
+if not api_key:
+    st.error(
+        "❌ OpenAI API Key를 찾을 수 없습니다.\n\n"
+        "Streamlit Cloud의 **Settings → Secrets** 에 다음처럼 등록해 주세요:\n"
+        "- `OPENAI_API_KEY = \"your_key_here\"`\n\n"
+        "키가 등록되면 새로고침 후 다시 시도해 주세요."
+    )
+    st.stop()
 
-def to_pil_image(uploaded_file) -> Image.Image:
-    data = uploaded_file.read()
-    return Image.open(io.BytesIO(data)).convert("RGB")
+client = OpenAI(api_key=api_key)
 
+with st.sidebar:
+    st.header("⚙️ 보고서 설정")
+    model = st.selectbox(
+        "사용 모델",
+        options=[
+            "gpt-4.1-mini",
+            "gpt-4.1",
+            "gpt-4o-mini",
+            "gpt-4o",
+        ],
+        index=0,
+        help="계정/권한에 따라 사용 가능한 모델이 다를 수 있습니다.",
+    )
 
-def main():
-    st.set_page_config(page_title="시설물 점검 보고서 생성기", layout="wide")
-    st.title("🛣️ 시설물 점검 보고서 생성 (이미지 → Gemini)")
+    st.subheader("🧾 메타정보(선택)")
+    project_name = st.text_input("프로젝트명", value="")
+    road_name = st.text_input("노선/구간", value="")
+    inspector = st.text_input("점검자", value="")
+    weather = st.text_input("날씨/환경", value="")
+    notes = st.text_area("비고", value="", height=120)
 
-    api_key = get_api_key()
-    if not api_key:
-        st.error(
-            "Gemini API Key가 설정되지 않았습니다.\n\n"
-            "Streamlit Cloud → App settings → Secrets에 아래처럼 추가하세요:\n"
-            'GEMINI_API_KEY = "YOUR_KEY"\n'
-        )
-        st.stop()
+    st.divider()
+    st.subheader("🧠 생성 옵션(선택)")
+    max_output_tokens = st.slider("최대 출력 토큰", min_value=300, max_value=2500, value=1200, step=50)
+    temperature = st.slider("창의성(temperature)", min_value=0.0, max_value=1.2, value=0.3, step=0.1)
 
-    with st.sidebar:
-        st.subheader("모델/출력 설정")
-        model = st.text_input("model", value="gemini-2.0-flash")
-        temperature = st.slider("temperature", 0.0, 1.0, 0.2, 0.05)
-        max_tokens = st.number_input("max_output_tokens", min_value=256, max_value=8192, value=2048, step=256)
-        st.divider()
-        st.caption("업무 보고서 안정성은 temperature 낮게(0.0~0.3) 추천")
+col_left, col_right = st.columns([1, 1], gap="large")
 
-    uploaded = st.file_uploader("점검 사진 1장을 업로드하세요 (JPG/PNG)", type=["jpg", "jpeg", "png"])
+with col_left:
+    st.subheader("1) 점검 이미지 업로드")
+    uploaded = st.file_uploader(
+        "PNG/JPG/JPEG/WEBP 파일만 업로드 가능",
+        type=ALLOWED_EXTS,
+        accept_multiple_files=False,
+        help="현장 점검 사진(포장, 균열, 배수, 표지, 시설물 등)을 업로드하세요.",
+    )
 
-    col1, col2 = st.columns([1, 1], gap="large")
+    if uploaded is not None:
+        st.image(uploaded, caption=f"업로드 이미지: {uploaded.name}", use_container_width=True)
 
-    with col1:
-        st.subheader("입력 이미지")
-        if uploaded:
-            img = to_pil_image(uploaded)
-            st.image(img, use_container_width=True)
+with col_right:
+    st.subheader("2) 보고서 생성 및 다운로드")
+
+    if "report_md" not in st.session_state:
+        st.session_state.report_md = ""
+
+    generate = st.button("🧾 보고서 생성하기", type="primary", use_container_width=True, disabled=(uploaded is None))
+
+    if generate:
+        if uploaded is None:
+            st.warning("이미지를 먼저 업로드해 주세요.")
         else:
-            st.info("사진을 업로드하면 보고서 생성이 가능합니다.")
+            try:
+                with st.spinner("이미지를 분석하고 보고서를 작성하는 중입니다..."):
+                    data_url = file_to_data_url(uploaded)
+                    prompt = build_prompt(project_name, road_name, inspector, weather, notes)
 
-    with col2:
-        st.subheader("생성 결과")
-        if not uploaded:
-            st.empty()
-            return
-
-        # 업로드 파일은 read()가 한 번 소비되므로, 버튼 클릭 때 다시 읽기 위해
-        # Streamlit이 제공하는 uploaded.getvalue()를 사용해 안전하게 처리
-        img_bytes = uploaded.getvalue()
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-
-        # (선택) 점검 개요에 넣을 수 있는 “사용자 입력” — 없으면 모델이 임의 생성하면 안 되니, 여기서 받는 게 안정적
-        with st.expander("점검 정보 입력(선택)", expanded=False):
-            facility_name = st.text_input("시설물 명/구간(선택)", value="")
-            inspection_date = st.date_input("점검일(선택)", value=None)
-            inspector = st.text_input("점검자(선택)", value="")
-            extra_notes = st.text_area("추가 메모(선택)", value="", height=80)
-
-        user_context_lines = []
-        if facility_name:
-            user_context_lines.append(f"- 시설물/구간: {facility_name}")
-        if inspection_date:
-            user_context_lines.append(f"- 점검일: {inspection_date.isoformat()}")
-        if inspector:
-            user_context_lines.append(f"- 점검자: {inspector}")
-        if extra_notes.strip():
-            user_context_lines.append(f"- 메모: {extra_notes.strip()}")
-
-        user_context = "\n".join(user_context_lines).strip()
-
-        if st.button("보고서 생성", type="primary", use_container_width=True):
-            client = get_client(api_key)
-
-            user_prompt = (
-                "첨부된 시설물 점검 사진 1장을 바탕으로, 위 기준과 형식을 엄격히 준수하여 보고서를 작성하라.\n"
-                "사진만으로 확정할 수 없는 내용은 반드시 '현장 확인 필요'로 표기하라.\n"
-            )
-            if user_context:
-                user_prompt += "\n[사용자 제공 점검 정보]\n" + user_context + "\n"
-
-            with st.spinner("Gemini가 보고서를 작성 중입니다..."):
-                try:
-                    resp = client.models.generate_content(
+                    resp = client.responses.create(
                         model=model,
-                        contents=[user_prompt, img],
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            temperature=float(temperature),
-                            max_output_tokens=int(max_tokens),
-                        ),
+                        input=[
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "input_text", "text": prompt},
+                                    {"type": "input_image", "image_url": data_url},
+                                ],
+                            }
+                        ],
+                        max_output_tokens=int(max_output_tokens),
+                        temperature=float(temperature),
                     )
-                except Exception as e:
-                    st.error(f"Gemini 호출 중 오류: {e}")
-                    st.stop()
 
-            report = (resp.text or "").strip()
-            if not report:
-                st.warning("응답 텍스트가 비어 있습니다. (안전필터/모델 응답 이슈 가능)")
-                return
+                    md = extract_text_from_response(resp)
 
-            st.markdown(report)
+                    # 보고서 상단에 간단 메타 헤더 추가(사용자 편의)
+                    header = f"""# 고속도로 점검 품질관리 보고서
 
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            st.download_button(
-                label="보고서 다운로드 (Markdown)",
-                data=report.encode("utf-8"),
-                file_name=f"inspection_report_{ts}.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
+- 생성일시: {st.session_state.get("generated_at", "")}
+- 파일명: {uploaded.name}
 
-            st.download_button(
-                label="보고서 다운로드 (TXT)",
-                data=report.encode("utf-8"),
-                file_name=f"inspection_report_{ts}.txt",
-                mime="text/plain",
-                use_container_width=True,
-            )
+---
+"""
+                    # generated_at 세팅 (한번만)
+                    if not st.session_state.get("generated_at"):
+                        from datetime import datetime, timezone, timedelta
 
+                        kst = timezone(timedelta(hours=9))
+                        st.session_state.generated_at = datetime.now(kst).strftime("%Y-%m-%d %H:%M:%S (KST)")
 
-if __name__ == "__main__":
-    main()
+                        header = f"""# 고속도로 점검 품질관리 보고서
+
+- 생성일시: {st.session_state.generated_at}
+- 파일명: {uploaded.name}
+
+---
+"""
+
+                    st.session_state.report_md = header + "\n" + md
+
+            except ValueError as ve:
+                st.error(f"❌ 업로드 파일 처리 중 오류가 발생했습니다: {ve}")
+            except Exception as e:
+                st.error(
+                    "❌ OpenAI API 호출 중 문제가 발생했습니다.\n\n"
+                    "가능한 원인:\n"
+                    "- API 키/권한 문제\n"
+                    "- 모델 사용 불가 또는 한도 초과\n"
+                    "- 네트워크 일시 오류\n\n"
+                    f"오류 상세: {type(e).__name__}: {e}"
+                )
+
+    if st.session_state.report_md:
+        st.success("✅ 보고서가 생성되었습니다!")
+        st.markdown(st.session_state.report_md)
+
+        st.download_button(
+            label="⬇️ 보고서 .md 다운로드",
+            data=st.session_state.report_md.encode("utf-8"),
+            file_name="highway_qc_report.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+    else:
+        st.info("오른쪽 상단의 **보고서 생성하기** 버튼을 누르면 결과가 여기 표시됩니다.")
+
+st.divider()
+with st.expander("🔐 Streamlit Secrets 설정 방법", expanded=False):
+    st.markdown(
+        """
+Streamlit Community Cloud에서 아래처럼 Secrets를 등록하세요.
+
+- 앱 대시보드 → **Settings** → **Secrets**
+- 다음을 추가:
+
+```toml
+OPENAI_API_KEY = "sk-..."
